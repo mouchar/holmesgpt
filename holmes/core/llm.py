@@ -19,6 +19,7 @@ from holmes.clients.robusta_client import (
     fetch_robusta_models,
 )
 from holmes.common.env_vars import (
+    AZURE_AD_TOKEN_AUTH,
     EXTRA_HEADERS,
     FALLBACK_CONTEXT_WINDOW_SIZE,
     LLM_REQUEST_TIMEOUT,
@@ -30,6 +31,7 @@ from holmes.common.env_vars import (
     TOOL_MAX_ALLOCATED_CONTEXT_WINDOW_PCT,
     TOOL_MAX_ALLOCATED_CONTEXT_WINDOW_TOKENS,
 )
+from holmes.core.azure_token import get_azure_ad_token
 from holmes.core.supabase_dal import SupabaseDal
 from holmes.utils.env import environ_get_safe_int, replace_env_vars_values
 from holmes.utils.file_utils import load_yaml_file
@@ -230,6 +232,23 @@ class DefaultLLM(LLM):
                 model_requirements = litellm.validate_environment(
                     model=model, api_key=api_key, api_base=api_base
                 )
+        elif provider == "azure":
+            model_requirements = litellm.validate_environment(
+                model=model, api_key=api_key, api_base=api_base, api_version=api_version
+            )
+            # litellm.validate_environment simply set all AZURE_* variables to missing_keys for azure models when any
+            # of the variables are missing.
+            # Remove AZURE_* keys from missing if they are actually set in the environment
+            for key in ["AZURE_API_BASE", "AZURE_API_KEY", "AZURE_API_VERSION"]:
+                if key in os.environ and key in model_requirements["missing_keys"]:
+                    model_requirements["missing_keys"].remove(key)  # type: ignore
+            # When using Azure AD token auth, AZURE_API_KEY is not required
+            if AZURE_AD_TOKEN_AUTH and "AZURE_API_KEY" in model_requirements["missing_keys"]:
+                model_requirements["missing_keys"].remove("AZURE_API_KEY")  # type: ignore
+
+            if not model_requirements["missing_keys"]:
+                model_requirements["keys_in_environment"] = True
+
         else:
             model_requirements = litellm.validate_environment(
                 model=model, api_key=api_key, api_base=api_base
@@ -409,6 +428,18 @@ class DefaultLLM(LLM):
         litellm_to_use = self.tracer.wrap_llm(litellm) if self.tracer else litellm
 
         litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
+
+        # When Azure AD (Entra ID) token auth is enabled, obtain a cached token
+        # and pass it to litellm instead of an API key.
+        azure_ad_kwargs: Dict[str, Any] = {}
+        if AZURE_AD_TOKEN_AUTH and litellm_model_name.startswith("azure/"):
+            # For LiteLLM Azure provider, pass the bearer token via azure_ad_token
+            # LiteLLM will send it as Authorization: Bearer <token>
+            azure_ad_kwargs["azure_ad_token"] = get_azure_ad_token()
+            # Also, ensure we do not leak stale API keys when using Entra ID
+            # Leave api_key as None in completion call when AZURE_AD_TOKEN_AUTH is enabled
+            self.api_key = None
+
         result = litellm_to_use.completion(
             model=litellm_model_name,
             api_key=self.api_key,
@@ -420,6 +451,7 @@ class DefaultLLM(LLM):
             allowed_openai_params=allowed_openai_params,
             stream=stream,
             timeout=LLM_REQUEST_TIMEOUT,
+            **azure_ad_kwargs,
             **tools_args,
             **self.args,
             cache_control_injection_points=[
